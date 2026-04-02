@@ -1,19 +1,13 @@
 // PATH: dashboard.ts
 // blessed-contrib (github.com/yaronn/blessed-contrib 15.7k stars)
 //
-// FIX 1: gaugeList showed only index numbers (0,1,2) because setGauges()
-//   was called before screen.render(). ctx is assigned in the canvas 'attach'
-//   event which fires only after the first screen.render(). Confirmed from
-//   canvas.js source: self.ctx = self._canvas.getContext() inside on('attach').
-//   Fix: call screen.render() once before first update(), guard all canvas
-//   widget calls with a ctx-exists check.
-//
-// FIX 2: dashboard crashed during recovery because monitor child process
-//   stdout/stderr leaked to terminal despite log file fd redirect. Under sudo,
-//   subprocesses spawned by fix-wifi.sh (ping, nmcli, modprobe) don't
-//   reliably inherit the parent's fd. fix-wifi.sh already uses
-//   `tee -a "$LOG_FILE"` internally for all output. Use stdio:'ignore' on
-//   the monitor child and let fix-wifi.sh handle its own logging.
+// Changes in this version:
+// - startDashboard() accepts a second arg: onScreen(screen) callback
+//   so server.ts can hold the screen ref for clean SIGINT shutdown
+// - screen.destroy() restores terminal on exit
+// - ctx guard on all canvas widgets (gaugeList, gauge, bar)
+// - stdio:'ignore' on all execSync health checks in server.ts (ping leak fixed)
+// - predev script in package.json kills stale processes before start
 
 import blessed    from 'blessed';
 import contrib    from 'blessed-contrib';
@@ -45,7 +39,8 @@ export interface TelemetrySnapshot {
   dbFile:             string;
 }
 
-export type TelemetryFn = () => TelemetrySnapshot;
+export type TelemetryFn  = () => TelemetrySnapshot;
+export type OnScreenFn   = (screen: any) => void;
 
 function dbQuery(dbFile: string, sql: string): string[][] {
   if (!fs.existsSync(dbFile)) return [];
@@ -59,15 +54,20 @@ function dbQuery(dbFile: string, sql: string): string[][] {
   } catch { return []; }
 }
 
-// Guard: only call setGauges/setPercent/setData after ctx exists (after render)
-function hasCtx(widget: any): boolean {
-  return !!(widget && widget.ctx);
-}
+function hasCtx(w: any): boolean { return !!(w && w.ctx); }
 
-export function startDashboard(getTelemetry: TelemetryFn): void {
+export function startDashboard(getTelemetry: TelemetryFn, onScreen?: OnScreenFn): void {
 
   const screen = blessed.screen({ smartCSR: true, title: 'BCM4331 Forensic Controller v39.8' });
-  screen.key(['q', 'C-c'], () => process.exit(0));
+
+  // Pass screen back to server.ts for clean SIGINT/SIGTERM shutdown
+  if (onScreen) onScreen(screen);
+
+  // q and Ctrl-C both restore terminal and exit cleanly
+  screen.key(['q', 'C-c'], () => {
+    screen.destroy();
+    process.exit(0);
+  });
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen });
 
@@ -87,7 +87,6 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
   });
 
   // ── Row 4-5: Status panels ────────────────────────────────────────────────
-  // gaugeList: ctx assigned on 'attach' — only call setGauges after render()
   const healthGauges = grid.set(4, 0, 2, 4, contrib.gaugeList, {
     label: ' Health Components ',
     gauges: [
@@ -115,11 +114,11 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
   });
 
   const cmdTable = grid.set(4, 9, 2, 3, contrib.table, {
-    label:       ' Last Commands ',
-    keys:        false,
-    interactive: false,
+    label:         ' Last Commands ',
+    keys:          false,
+    interactive:   false,
     columnSpacing: 1,
-    columnWidth: [2, 20],
+    columnWidth:   [2, 20],
   });
 
   // ── Row 6-8: Log + Telemetry ──────────────────────────────────────────────
@@ -147,24 +146,24 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
     columnWidth:   [20, 18, 52],
   });
 
-  // ── History buffers — index labels prevent nullnull ───────────────────────
-  const MAX_HIST   = 30;
-  const sigHist:   number[] = Array(MAX_HIST).fill(0);
-  const rxHist:    number[] = Array(MAX_HIST).fill(0);
-  const txHist:    number[] = Array(MAX_HIST).fill(0);
+  // ── History buffers ───────────────────────────────────────────────────────
+  const MAX_HIST    = 30;
+  const sigHist:    number[] = Array(MAX_HIST).fill(0);
+  const rxHist:     number[] = Array(MAX_HIST).fill(0);
+  const txHist:     number[] = Array(MAX_HIST).fill(0);
   const timeLabels: string[] = Array.from({ length: MAX_HIST }, (_, i) => `-${MAX_HIST - i}s`);
 
-  // ── Log offset — start at EOF, show only new lines ────────────────────────
+  // ── Log offset: start at EOF ──────────────────────────────────────────────
   let logOffset = 0;
   const t0 = getTelemetry();
   if (t0.logFile && fs.existsSync(t0.logFile)) {
     try { logOffset = fs.statSync(t0.logFile).size; } catch { logOffset = 0; }
   }
 
-  // ── FIX 1: render once first so 'attach' fires and ctx is set ─────────────
+  // ── Initial render — required before setGauges/setPercent/setData ─────────
+  // canvas.js assigns ctx inside the 'attach' event which fires on render()
   screen.render();
 
-  // ── Update function ───────────────────────────────────────────────────────
   const update = () => {
     const t   = getTelemetry();
     const rx  = t.traffic.rx / 1024;
@@ -176,7 +175,6 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
     txHist.push(tx);        txHist.shift();
     timeLabels.push(now);   timeLabels.shift();
 
-    // Line charts — ctx check not needed, line uses blessed Box not canvas
     const sigColor = t.signal >= -60 ? 'green' : t.signal >= -75 ? 'yellow' : 'red';
     signalLine.setData([{ title: 'dBm', x: timeLabels, y: sigHist, style: { line: sigColor } }]);
     trafficLine.setData([
@@ -184,7 +182,6 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
       { title: 'TX', x: timeLabels, y: txHist, style: { line: 'yellow' } },
     ]);
 
-    // Canvas widgets — guard with hasCtx (ctx only exists after first render)
     if (hasCtx(healthGauges)) {
       healthGauges.setGauges([
         { stack: [{ percent: t.healthPing  >= 40 ? 100 : 0, stroke: 'green'  }], label: 'Ping  40pt' },
@@ -194,15 +191,12 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
       ]);
     }
 
-    if (hasCtx(healthGauge)) {
-      healthGauge.setPercent(t.health);
-    }
+    if (hasCtx(healthGauge)) healthGauge.setPercent(t.health);
 
     if (hasCtx(pidBar)) {
       pidBar.setData({ titles: ['Kp', 'Ki', 'Kd'], data: [t.pidKp, t.pidKi, t.pidKd] });
     }
 
-    // Table widgets use Box not canvas — no ctx guard needed
     const cmds = dbQuery(t.dbFile,
       'SELECT exit_code, command FROM commands ORDER BY rowid DESC LIMIT 5;');
     cmdTable.setData({
@@ -212,7 +206,6 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
         : [['—', 'No commands yet']],
     });
 
-    // Log — new bytes from file only
     if (t.logFile && fs.existsSync(t.logFile)) {
       try {
         const stat = fs.statSync(t.logFile);
@@ -271,7 +264,6 @@ export function startDashboard(getTelemetry: TelemetryFn): void {
     screen.render();
   };
 
-  // First update after initial render — ctx now exists for all canvas widgets
   update();
   setInterval(update, 2000);
 }

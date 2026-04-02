@@ -12,6 +12,10 @@ const WORKSPACE_DIR = process.cwd();
 const LOG_FILE      = path.join(WORKSPACE_DIR, "verbatim_handshake.log");
 const DB_FILE       = path.join(WORKSPACE_DIR, "recovery_state.db");
 
+// ── All output goes to log file — never stdout/stderr after startup ───────────
+// stdout is owned by blessed after startDashboard() is called.
+// stderr lines written before blessed starts appear in the terminal briefly
+// then get overwritten — acceptable. After blessed starts, use fileOnly only.
 const fileOnly = (msg: string) => {
   const ts = new Date().toISOString();
   try { fs.appendFileSync(LOG_FILE, `[SERVER ${ts}] ${msg}\n`); } catch { /* ignore */ }
@@ -24,8 +28,23 @@ const log = (msg: string) => {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* ignore */ }
 };
 
-process.on('unhandledRejection', (r) => fileOnly(`UNHANDLED REJECTION: ${r}`));
-process.on('uncaughtException',  (e) => fileOnly(`UNCAUGHT EXCEPTION: ${(e as Error).message}`));
+// ── Clean shutdown ────────────────────────────────────────────────────────────
+// Handles SIGINT (Ctrl-C), SIGTERM, and uncaught errors.
+// blessed.screen().destroy() restores the terminal before exit.
+let screenRef: any = null;
+
+const shutdown = (code = 0) => {
+  fileOnly(`Shutting down (code ${code})`);
+  try { if (screenRef) { screenRef.destroy(); } } catch { /* ignore */ }
+  // Kill the monitor process group
+  try { execSync("pkill -f 'fix-wifi --monitor' 2>/dev/null || true"); } catch { /* ignore */ }
+  process.exit(code);
+};
+
+process.on('SIGINT',  () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
+process.on('unhandledRejection', (r) => { fileOnly(`UNHANDLED REJECTION: ${r}`); });
+process.on('uncaughtException',  (e: Error) => { fileOnly(`UNCAUGHT EXCEPTION: ${e.message}\n${e.stack}`); shutdown(1); });
 
 log(`Initializing Broadcom Control Center...`);
 log(`WORKSPACE_DIR: ${WORKSPACE_DIR}`);
@@ -76,10 +95,10 @@ const dbGet = (key: string, fallback: string): string => {
   } catch { return fallback; }
 };
 
-// runCommand: used for setup/repair — pipes to log file only
+// ── runCommand: all child output → log file only, never terminal ──────────────
 const runCommand = (cmd: string): Promise<void> =>
   new Promise((resolve, reject) => {
-    const child = spawn(cmd, [], { shell: true, stdio: ['inherit', 'pipe', 'pipe'] });
+    const child = spawn(cmd, [], { shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout?.on('data', d => d.toString().split('\n')
       .forEach((l: string) => { if (l.trim()) fileOnly(`[OUT] ${l}`); }));
     child.stderr?.on('data', d => d.toString().split('\n')
@@ -87,21 +106,12 @@ const runCommand = (cmd: string): Promise<void> =>
     child.on('close', code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
   });
 
-// FIX 2: startMonitor uses stdio:'ignore' — fix-wifi.sh already tees all
-// output to LOG_FILE via `tee -a "$LOG_FILE"` (confirmed from source line
-// log_and_tee() function). Previous fd-redirect approach failed because
-// sudo subprocesses (ping, nmcli, modprobe) spawned by fix-wifi.sh did not
-// reliably inherit the parent's file descriptor, leaking to terminal and
-// corrupting the blessed screen buffer during recovery.
+// ── startMonitor: stdio:ignore — fix-wifi.sh tees its own output to LOG_FILE ──
 const startMonitor = () => {
   fileOnly('Starting background monitor');
   const child = spawn(
     `sudo -n PROJECT_ROOT="${WORKSPACE_DIR}" "${FIX_SCRIPT}" --monitor --workspace "${WORKSPACE_DIR}"`,
-    [], {
-      shell: true,
-      stdio: 'ignore',   // fix-wifi.sh tees its own output to LOG_FILE
-      detached: false,
-    }
+    [], { shell: true, stdio: 'ignore', detached: false }
   );
   child.on('close', code => {
     fileOnly(`Monitor exited (${code}) — restarting in 5s`);
@@ -139,6 +149,7 @@ const checkForUpdates = () => {
   } catch { /* no network */ }
 };
 
+// ── API Routes ────────────────────────────────────────────────────────────────
 app.get("/api/status", (_req, res) =>
   res.json({ isFixing, lastFixError, ...currentTelemetry, metricsHistory, gitUpdateAvailable, localSha, remoteSha })
 );
@@ -240,9 +251,13 @@ app.get("/api/events", (req, res) => {
   req.on("close", () => clearInterval(iv));
 });
 
+// ── Startup ───────────────────────────────────────────────────────────────────
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: { port: 24678 } },
+      appType: "spa",
+    });
     app.use(vite.middlewares);
   } else {
     const dist = path.join(WORKSPACE_DIR, 'dist');
@@ -256,6 +271,7 @@ async function startServer() {
     checkForUpdates();
     setInterval(checkForUpdates, 60000);
 
+    // ── Telemetry tick ────────────────────────────────────────────────────────
     setInterval(() => {
       const ts = new Date().toISOString();
       let signal = 0, traffic = { rx: 0, tx: 0 }, connectivity = false;
@@ -263,13 +279,13 @@ async function startServer() {
       let healthPing = 0, healthDns = 0, healthRoute = 0;
 
       try {
-        bkwInterface = dbGet('bkw_interface', 'Unknown');
-        currentTelemetry.pidKp      = parseInt(dbGet('pid_kp',       '800'));
-        currentTelemetry.pidKi      = parseInt(dbGet('pid_ki',       '50'));
-        currentTelemetry.pidKd      = parseInt(dbGet('pid_kd',       '300'));
-        currentTelemetry.pidSignal  = parseInt(dbGet('pid_signal',   '0'));
-        currentTelemetry.pidIError  = parseInt(dbGet('pid_i_error',  '0'));
-        currentTelemetry.pidPrevError = parseInt(dbGet('pid_prev_error', '0'));
+        bkwInterface                  = dbGet('bkw_interface',    'Unknown');
+        currentTelemetry.pidKp        = parseInt(dbGet('pid_kp',        '800'));
+        currentTelemetry.pidKi        = parseInt(dbGet('pid_ki',        '50'));
+        currentTelemetry.pidKd        = parseInt(dbGet('pid_kd',        '300'));
+        currentTelemetry.pidSignal    = parseInt(dbGet('pid_signal',    '0'));
+        currentTelemetry.pidIError    = parseInt(dbGet('pid_i_error',   '0'));
+        currentTelemetry.pidPrevError = parseInt(dbGet('pid_prev_error','0'));
 
         try {
           const m = execSync(
@@ -286,9 +302,9 @@ async function startServer() {
         } catch { /* ignore */ }
 
         if (!isSimulatingFault) {
-          try { execSync("ping -c 1 -W 1 8.8.8.8",       { timeout: 1500 }); healthPing  = 40; connectivity = true; } catch { }
-          try { execSync("getent hosts google.com",        { timeout: 1500 }); healthDns   = 30; } catch { }
-          try { execSync("ip route | grep -q '^default'", { timeout: 1000 }); healthRoute = 30; } catch { }
+          try { execSync("ping -c 1 -W 1 8.8.8.8",        { timeout: 1500, stdio: 'ignore' }); healthPing  = 40; connectivity = true; } catch { }
+          try { execSync("getent hosts google.com",         { timeout: 1500, stdio: 'ignore' }); healthDns   = 30; } catch { }
+          try { execSync("ip route | grep -q '^default'",  { timeout: 1000, stdio: 'ignore' }); healthRoute = 30; } catch { }
         } else {
           signal = -99; traffic = { rx: 0, tx: 0 };
         }
@@ -308,17 +324,21 @@ async function startServer() {
       fileOnly(`tick signal=${signal} conn=${connectivity} health=${health} ping=${healthPing} dns=${healthDns} route=${healthRoute}`);
     }, 2000);
 
+    // ── Start dashboard — pass screenRef back for clean shutdown ──────────────
     setTimeout(() => {
-      startDashboard(() => ({
-        ...currentTelemetry,
-        isFixing,
-        gitUpdateAvailable,
-        localSha,
-        remoteSha,
-        metricsHistory,
-        logFile: LOG_FILE,
-        dbFile:  DB_FILE,
-      }));
+      startDashboard(
+        () => ({
+          ...currentTelemetry,
+          isFixing,
+          gitUpdateAvailable,
+          localSha,
+          remoteSha,
+          metricsHistory,
+          logFile: LOG_FILE,
+          dbFile:  DB_FILE,
+        }),
+        (screen: any) => { screenRef = screen; }
+      );
     }, 100);
   });
 }

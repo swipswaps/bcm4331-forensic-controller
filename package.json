@@ -4,44 +4,31 @@
   "version": "39.8.0",
   "type": "module",
   "scripts": {
+    "predev": "fuser -k 3000/tcp 24678/tcp 2>/dev/null; pkill -f 'tsx server.ts' 2>/dev/null; pkill -f 'fix-wifi --monitor' 2>/dev/null; sleep 1; true",
     "dev": "PROJECT_ROOT=$(pwd) tsx server.ts",
     "setup": "chmod +x *.sh && PROJECT_ROOT=$(pwd) ./setup-system.sh",
-    "cold-start": "PROJECT_ROOT=$(pwd) ./cold-start.sh",
-    "sync": "PROJECT_ROOT=$(pwd) ./sync-updates.sh",
-    "build": "vite build",
-    "lint": "eslint . --max-warnings 0",
-    "preview": "vite preview"
+    "cold-start": "PROJECT_ROOT=$(pwd) bash cold-start.sh",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "update": "git pull origin master && npm install && npm run dev"
   },
   "dependencies": {
-    "@google/genai": "^1.29.0",
-    "clsx": "^2.1.1",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "recharts": "^2.12.7",
-    "tailwind-merge": "^2.3.0"
+    "better-sqlite3": "^9.4.3",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
+    "express": "^4.18.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recharts": "^2.10.3",
+    "vite": "^5.0.8"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.1.14",
+    "@types/blessed": "^0.1.25",
     "@types/express": "^4.17.21",
-    "@types/node": "^22.14.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.58.0",
-    "@typescript-eslint/parser": "^8.58.0",
-    "@vitejs/plugin-react": "^5.0.4",
-    "autoprefixer": "^10.4.21",
-    "eslint": "^9.39.4",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.5.2",
-    "globals": "^17.4.0",
-    "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
-    "typescript": "~5.8.2",
-    "typescript-eslint": "^8.58.0",
-    "vite": "^6.2.0"
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
   }
 }
