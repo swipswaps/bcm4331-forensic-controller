@@ -12,16 +12,13 @@ const WORKSPACE_DIR = process.cwd();
 const LOG_FILE      = path.join(WORKSPACE_DIR, "verbatim_handshake.log");
 const DB_FILE       = path.join(WORKSPACE_DIR, "recovery_state.db");
 
-// ── fileOnly: all writes during tick go to log file — never stdout ────────────
-// stdout is owned by blessed after startDashboard() is called.
 const fileOnly = (msg: string) => {
   const ts = new Date().toISOString();
   try { fs.appendFileSync(LOG_FILE, `[SERVER ${ts}] ${msg}\n`); } catch { /* ignore */ }
 };
 
-// ── Startup messages go to stderr — visible before blessed takes screen ───────
 const log = (msg: string) => {
-  const ts  = new Date().toISOString();
+  const ts   = new Date().toISOString();
   const line = `[SERVER ${ts}] ${msg}`;
   process.stderr.write(line + '\n');
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* ignore */ }
@@ -42,25 +39,22 @@ log(`FIX_SCRIPT: ${FIX_SCRIPT}`);
 
 app.use(express.json());
 
-// ── Shared state — all fields needed by dashboard ─────────────────────────────
 let isFixing          = false;
 let isSimulatingFault = false;
 let lastFixError: string | null = null;
 const metricsHistory: { timestamp: string; signal: number; rx: number; tx: number }[] = [];
 
+// All telemetry fields — healthPing/Dns/Route match fix-wifi.sh calculate_health() exactly
 let currentTelemetry = {
   signal:       0,
   traffic:      { rx: 0, tx: 0 },
   connectivity: false,
   bkwInterface: "Unknown",
-  // Health — overall + per-component matching fix-wifi.sh calculate_health()
-  // ping=40pts, DNS=30pts, default_route=30pts (confirmed from source)
   health:       0,
-  healthPing:   0,
-  healthDns:    0,
-  healthRoute:  0,
+  healthPing:   0,  // 0 or 40 — ping -c3 8.8.8.8
+  healthDns:    0,  // 0 or 30 — getent hosts google.com
+  healthRoute:  0,  // 0 or 30 — ip route | grep default
   timestamp:    new Date().toISOString(),
-  // PID state — keys confirmed from fix-wifi.sh DB writes
   pidKp:        800,
   pidKi:        50,
   pidKd:        300,
@@ -73,21 +67,16 @@ let gitUpdateAvailable = false;
 let localSha  = "";
 let remoteSha = "";
 
-// ── DB helper ─────────────────────────────────────────────────────────────────
 const dbGet = (key: string, fallback: string): string => {
   if (!fs.existsSync(DB_FILE)) return fallback;
   try {
-    return execSync(`sqlite3 "${DB_FILE}" "SELECT value FROM config WHERE key='${key}';"`,
-      { timeout: 1000, encoding: 'utf8' }).trim() || fallback;
+    return execSync(
+      `sqlite3 "${DB_FILE}" "SELECT value FROM config WHERE key='${key}';"`,
+      { timeout: 1000, encoding: 'utf8' }
+    ).trim() || fallback;
   } catch { return fallback; }
 };
 
-const dbSet = (key: string, value: string) => {
-  const ts = new Date().toISOString();
-  execSync(`sqlite3 "${DB_FILE}" "INSERT OR REPLACE INTO config (key, value, last_updated) VALUES ('${key}', '${value}', '${ts}');"`);
-};
-
-// ── runCommand — stdout/stderr → log file only ────────────────────────────────
 const runCommand = (cmd: string): Promise<void> =>
   new Promise((resolve, reject) => {
     const child = spawn(cmd, [], { shell: true, stdio: ['inherit', 'pipe', 'pipe'] });
@@ -98,7 +87,6 @@ const runCommand = (cmd: string): Promise<void> =>
     child.on('close', code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
   });
 
-// ── startMonitor — child output → log file fd, never console ─────────────────
 const startMonitor = () => {
   fileOnly('Starting background monitor');
   let fd: number;
@@ -114,7 +102,6 @@ const startMonitor = () => {
   });
 };
 
-// ── rapidRepair ───────────────────────────────────────────────────────────────
 const rapidRepair = async () => {
   fileOnly('Starting rapid repair...');
   try {
@@ -136,18 +123,15 @@ const rapidRepair = async () => {
   }
 };
 
-// ── Git update detection ──────────────────────────────────────────────────────
 const checkForUpdates = () => {
   try {
     execSync('git fetch origin', { cwd: WORKSPACE_DIR, timeout: 10000, stdio: 'ignore' });
     localSha  = execSync('git rev-parse HEAD',          { cwd: WORKSPACE_DIR, encoding: 'utf8' }).trim().slice(0, 7);
     remoteSha = execSync('git rev-parse origin/master', { cwd: WORKSPACE_DIR, encoding: 'utf8' }).trim().slice(0, 7);
     gitUpdateAvailable = localSha !== remoteSha;
-    if (gitUpdateAvailable) fileOnly(`Update available: local=${localSha} remote=${remoteSha}`);
-  } catch { /* no network — skip */ }
+  } catch { /* no network */ }
 };
 
-// ── API Routes ────────────────────────────────────────────────────────────────
 app.get("/api/status", (_req, res) =>
   res.json({ isFixing, lastFixError, ...currentTelemetry, metricsHistory, gitUpdateAvailable, localSha, remoteSha })
 );
@@ -159,8 +143,8 @@ app.get('/api/audit', async (_req, res) => {
     if (fs.existsSync(DB_FILE)) {
       try {
         dbMilestones = execSync(
-          `sqlite3 -separator "|" "${DB_FILE}" "SELECT timestamp, name, details FROM milestones ORDER BY timestamp ASC;"`)
-          .toString();
+          `sqlite3 -separator "|" "${DB_FILE}" "SELECT timestamp, name, details FROM milestones ORDER BY timestamp ASC;"`
+        ).toString();
       } catch (e) { dbMilestones = `Error: ${e}`; }
     }
     res.json({ status: 'RECOVERY_COMPLETE', verbatimLogSnippet: logContent.slice(-8000), dbMilestones });
@@ -197,9 +181,10 @@ app.get("/api/config", (_req, res) => {
 app.post("/api/config", (req, res) => {
   const { kp, ki, kd } = req.body;
   try {
-    dbSet('pid_kp', String(kp));
-    dbSet('pid_ki', String(ki));
-    dbSet('pid_kd', String(kd));
+    const ts = new Date().toISOString();
+    const s = (k: string, v: string) =>
+      execSync(`sqlite3 "${DB_FILE}" "INSERT OR REPLACE INTO config (key, value, last_updated) VALUES ('${k}', '${v}', '${ts}');"`);
+    s('pid_kp', kp); s('pid_ki', ki); s('pid_kd', kd);
     currentTelemetry.pidKp = parseInt(kp);
     currentTelemetry.pidKi = parseInt(ki);
     currentTelemetry.pidKd = parseInt(kd);
@@ -248,7 +233,6 @@ app.get("/api/events", (req, res) => {
   req.on("close", () => clearInterval(iv));
 });
 
-// ── Startup ───────────────────────────────────────────────────────────────────
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
@@ -265,28 +249,23 @@ async function startServer() {
     checkForUpdates();
     setInterval(checkForUpdates, 60000);
 
-    // ── Telemetry tick ────────────────────────────────────────────────────────
     setInterval(() => {
-      const ts  = new Date().toISOString();
+      const ts = new Date().toISOString();
       let signal = 0, traffic = { rx: 0, tx: 0 }, connectivity = false;
       let bkwInterface = "Unknown";
-      // Per-component health matching fix-wifi.sh calculate_health() exactly:
-      // ping=40, dns=30, route=30
       let healthPing = 0, healthDns = 0, healthRoute = 0;
 
       try {
-        // Interface from DB
         bkwInterface = dbGet('bkw_interface', 'Unknown');
 
-        // PID state from DB — fix-wifi.sh writes these during monitor loop
-        currentTelemetry.pidKp      = parseInt(dbGet('pid_kp',      '800'));
-        currentTelemetry.pidKi      = parseInt(dbGet('pid_ki',      '50'));
-        currentTelemetry.pidKd      = parseInt(dbGet('pid_kd',      '300'));
-        currentTelemetry.pidSignal  = parseInt(dbGet('pid_signal',  '0'));
-        currentTelemetry.pidIError  = parseInt(dbGet('pid_i_error', '0'));
+        // PID state from DB — written by fix-wifi.sh monitor loop
+        currentTelemetry.pidKp      = parseInt(dbGet('pid_kp',       '800'));
+        currentTelemetry.pidKi      = parseInt(dbGet('pid_ki',       '50'));
+        currentTelemetry.pidKd      = parseInt(dbGet('pid_kd',       '300'));
+        currentTelemetry.pidSignal  = parseInt(dbGet('pid_signal',   '0'));
+        currentTelemetry.pidIError  = parseInt(dbGet('pid_i_error',  '0'));
         currentTelemetry.pidPrevError = parseInt(dbGet('pid_prev_error', '0'));
 
-        // Signal via iw
         try {
           const m = execSync(
             "iw dev | grep Interface | awk '{print $2}' | xargs -I {} iw dev {} link",
@@ -295,18 +274,17 @@ async function startServer() {
           if (m) signal = parseInt(m[1]);
         } catch { /* ignore */ }
 
-        // Traffic from /proc/net/dev
         try {
           const s = execSync("cat /proc/net/dev | grep -E 'wl|wlan' || true",
             { timeout: 1000, encoding: 'utf8' }).trim().split(/\s+/);
           if (s.length > 10) traffic = { rx: parseInt(s[1]), tx: parseInt(s[9]) };
         } catch { /* ignore */ }
 
-        // Per-component health — mirrors fix-wifi.sh calculate_health() exactly
+        // Health components — mirrors fix-wifi.sh calculate_health() exactly
         if (!isSimulatingFault) {
           try { execSync("ping -c 1 -W 1 8.8.8.8", { timeout: 1500 }); healthPing = 40; connectivity = true; }
           catch { healthPing = 0; connectivity = false; }
-          try { execSync("getent hosts google.com", { timeout: 1500 }); healthDns = 30; }
+          try { execSync("getent hosts google.com",    { timeout: 1500 }); healthDns   = 30; }
           catch { healthDns = 0; }
           try { execSync("ip route | grep -q '^default'", { timeout: 1000 }); healthRoute = 30; }
           catch { healthRoute = 0; }
@@ -320,8 +298,7 @@ async function startServer() {
       currentTelemetry = {
         ...currentTelemetry,
         signal, traffic, connectivity,
-        bkwInterface,
-        health, healthPing, healthDns, healthRoute,
+        bkwInterface, health, healthPing, healthDns, healthRoute,
         timestamp: ts,
       };
 
@@ -332,8 +309,7 @@ async function startServer() {
 
     }, 2000);
 
-    // ── Start blessed-contrib dashboard after first tick (100ms delay) ────────
-    // Gives the tick one cycle to populate currentTelemetry before rendering.
+    // Start dashboard after one tick
     setTimeout(() => {
       startDashboard(() => ({
         ...currentTelemetry,
