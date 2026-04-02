@@ -1,0 +1,5 @@
+{
+  "name": "Broadcom BCM4331 Forensic Controller",
+  "description": "A hardened, forensic-grade, self-healing Wi-Fi recovery suite for Broadcom BCM4331 chipsets on Fedora.",
+  "requestFramePermissions": []
+}

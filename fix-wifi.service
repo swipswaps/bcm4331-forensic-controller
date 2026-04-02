@@ -1,0 +1,9 @@
+[Unit]
+Description=BCM4331 Forensic Recovery Service
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=PROJECT_ROOT=/home/owner/bcm4331-fedora-deterministic-network-controller
+ExecStart=/usr/local/bin/fix-wifi --workspace ${PROJECT_ROOT}
+RemainAfterExit=yes
