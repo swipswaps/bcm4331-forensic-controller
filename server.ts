@@ -44,16 +44,15 @@ let isSimulatingFault = false;
 let lastFixError: string | null = null;
 const metricsHistory: { timestamp: string; signal: number; rx: number; tx: number }[] = [];
 
-// All telemetry fields — healthPing/Dns/Route match fix-wifi.sh calculate_health() exactly
 let currentTelemetry = {
   signal:       0,
   traffic:      { rx: 0, tx: 0 },
   connectivity: false,
   bkwInterface: "Unknown",
   health:       0,
-  healthPing:   0,  // 0 or 40 — ping -c3 8.8.8.8
-  healthDns:    0,  // 0 or 30 — getent hosts google.com
-  healthRoute:  0,  // 0 or 30 — ip route | grep default
+  healthPing:   0,
+  healthDns:    0,
+  healthRoute:  0,
   timestamp:    new Date().toISOString(),
   pidKp:        800,
   pidKi:        50,
@@ -77,6 +76,7 @@ const dbGet = (key: string, fallback: string): string => {
   } catch { return fallback; }
 };
 
+// runCommand: used for setup/repair — pipes to log file only
 const runCommand = (cmd: string): Promise<void> =>
   new Promise((resolve, reject) => {
     const child = spawn(cmd, [], { shell: true, stdio: ['inherit', 'pipe', 'pipe'] });
@@ -87,16 +87,23 @@ const runCommand = (cmd: string): Promise<void> =>
     child.on('close', code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
   });
 
+// FIX 2: startMonitor uses stdio:'ignore' — fix-wifi.sh already tees all
+// output to LOG_FILE via `tee -a "$LOG_FILE"` (confirmed from source line
+// log_and_tee() function). Previous fd-redirect approach failed because
+// sudo subprocesses (ping, nmcli, modprobe) spawned by fix-wifi.sh did not
+// reliably inherit the parent's file descriptor, leaking to terminal and
+// corrupting the blessed screen buffer during recovery.
 const startMonitor = () => {
   fileOnly('Starting background monitor');
-  let fd: number;
-  try { fd = fs.openSync(LOG_FILE, 'a'); } catch { fd = 2; }
   const child = spawn(
     `sudo -n PROJECT_ROOT="${WORKSPACE_DIR}" "${FIX_SCRIPT}" --monitor --workspace "${WORKSPACE_DIR}"`,
-    [], { shell: true, stdio: ['inherit', fd, fd] }
+    [], {
+      shell: true,
+      stdio: 'ignore',   // fix-wifi.sh tees its own output to LOG_FILE
+      detached: false,
+    }
   );
   child.on('close', code => {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
     fileOnly(`Monitor exited (${code}) — restarting in 5s`);
     setTimeout(startMonitor, 5000);
   });
@@ -257,8 +264,6 @@ async function startServer() {
 
       try {
         bkwInterface = dbGet('bkw_interface', 'Unknown');
-
-        // PID state from DB — written by fix-wifi.sh monitor loop
         currentTelemetry.pidKp      = parseInt(dbGet('pid_kp',       '800'));
         currentTelemetry.pidKi      = parseInt(dbGet('pid_ki',       '50'));
         currentTelemetry.pidKd      = parseInt(dbGet('pid_kd',       '300'));
@@ -280,21 +285,16 @@ async function startServer() {
           if (s.length > 10) traffic = { rx: parseInt(s[1]), tx: parseInt(s[9]) };
         } catch { /* ignore */ }
 
-        // Health components — mirrors fix-wifi.sh calculate_health() exactly
         if (!isSimulatingFault) {
-          try { execSync("ping -c 1 -W 1 8.8.8.8", { timeout: 1500 }); healthPing = 40; connectivity = true; }
-          catch { healthPing = 0; connectivity = false; }
-          try { execSync("getent hosts google.com",    { timeout: 1500 }); healthDns   = 30; }
-          catch { healthDns = 0; }
-          try { execSync("ip route | grep -q '^default'", { timeout: 1000 }); healthRoute = 30; }
-          catch { healthRoute = 0; }
+          try { execSync("ping -c 1 -W 1 8.8.8.8",       { timeout: 1500 }); healthPing  = 40; connectivity = true; } catch { }
+          try { execSync("getent hosts google.com",        { timeout: 1500 }); healthDns   = 30; } catch { }
+          try { execSync("ip route | grep -q '^default'", { timeout: 1000 }); healthRoute = 30; } catch { }
         } else {
           signal = -99; traffic = { rx: 0, tx: 0 };
         }
       } catch { /* ignore */ }
 
       const health = healthPing + healthDns + healthRoute;
-
       currentTelemetry = {
         ...currentTelemetry,
         signal, traffic, connectivity,
@@ -306,10 +306,8 @@ async function startServer() {
       if (metricsHistory.length > 50) metricsHistory.shift();
 
       fileOnly(`tick signal=${signal} conn=${connectivity} health=${health} ping=${healthPing} dns=${healthDns} route=${healthRoute}`);
-
     }, 2000);
 
-    // Start dashboard after one tick
     setTimeout(() => {
       startDashboard(() => ({
         ...currentTelemetry,
