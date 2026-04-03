@@ -4,7 +4,6 @@
   "version": "39.8.0",
   "type": "module",
   "scripts": {
-    "predev": "lsof -ti:3000 | xargs -r kill -9 2>/dev/null; lsof -ti:24678 | xargs -r kill -9 2>/dev/null; pkill -f 'fix-wifi --monitor' 2>/dev/null; sleep 1; true",
     "dev": "PROJECT_ROOT=$(pwd) tsx server.ts",
     "setup": "chmod +x *.sh && PROJECT_ROOT=$(pwd) ./setup-system.sh",
     "cold-start": "PROJECT_ROOT=$(pwd) bash cold-start.sh",

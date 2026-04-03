@@ -252,7 +252,29 @@ app.get("/api/events", (req, res) => {
 });
 
 // ── Startup ───────────────────────────────────────────────────────────────────
+
+// ── Kill stale process on port before binding ─────────────────────────────────
+// Runs inside Node so it cannot kill its own process group.
+// Uses lsof to find the PID then kills only that specific PID.
+const killPortOccupant = (port: number): void => {
+  try {
+    const pid = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
+    if (pid && pid !== String(process.pid)) {
+      pid.split('\n').forEach(p => {
+        const n = parseInt(p.trim());
+        if (n && n !== process.pid) {
+          try { process.kill(n, 'SIGTERM'); } catch { /* already gone */ }
+        }
+      });
+      // Give processes 1s to exit cleanly
+      execSync('sleep 1');
+    }
+  } catch { /* ignore */ }
+};
+
 async function startServer() {
+  killPortOccupant(3000);
+  killPortOccupant(24678);
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: { port: 24678 } },
