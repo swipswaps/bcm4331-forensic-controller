@@ -282,8 +282,8 @@ const rapidRepair = async () => {
 const checkForUpdates = () => {
   try {
     execSync('git fetch origin', { cwd: WORKSPACE_DIR, timeout: 10000, stdio: 'ignore' });
-    localSha  = execSync('git rev-parse HEAD',          { cwd: WORKSPACE_DIR, encoding: 'utf8' }).trim().slice(0, 7);
-    remoteSha = execSync('git rev-parse origin/master', { cwd: WORKSPACE_DIR, encoding: 'utf8' }).trim().slice(0, 7);
+    localSha  = execSync('git rev-parse HEAD',          { cwd: WORKSPACE_DIR, encoding: 'utf8', stdio: ['ignore','pipe','ignore'] }).trim().slice(0, 7);
+    remoteSha = execSync('git rev-parse origin/master', { cwd: WORKSPACE_DIR, encoding: 'utf8', stdio: ['ignore','pipe','ignore'] }).trim().slice(0, 7);
     gitUpdateAvailable = localSha !== remoteSha;
   } catch { /* no network */ }
 };

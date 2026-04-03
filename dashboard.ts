@@ -89,7 +89,12 @@ export function startDashboard(getTelemetry: TelemetryFn, onScreen?: OnScreenFn)
   });
   if (onScreen) onScreen(screen);
 
-  screen.key(['q', 'C-c'], () => { screen.destroy(); process.exit(0); });
+  // Handle both blessed keypress (raw mode) AND process signal (tsx intercept).
+  // tsx intercepts SIGINT before blessed sees C-c as a keypress — need both.
+  const cleanExit = () => { try { screen.destroy(); } catch { /* ignore */ } process.exit(0); };
+  screen.key(['q', 'C-c'], cleanExit);
+  process.on('SIGINT',  cleanExit);
+  process.on('SIGTERM', cleanExit);
 
   // Tab cycles focus between scrollable widgets
   let focusIdx = 0;
