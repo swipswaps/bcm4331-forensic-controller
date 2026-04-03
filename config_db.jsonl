@@ -1,0 +1,4 @@
+{"timestamp":"2026-04-03T10:05:40-04:00","type":"hardware","name":"cpu_test","data":{"cpu":"x86_64"}}
+{"timestamp":"2026-04-03T10:05:40-04:00","type":"software","name":"node_test","data":{"node":"18"}}
+{"timestamp":"2026-04-03T10:08:18-04:00","type":"hardware","name":"cpu_test","data":{"cpu":"x86_64"}}
+{"timestamp":"2026-04-03T10:08:18-04:00","type":"software","name":"node_test","data":{"node":"18"}}
