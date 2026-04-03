@@ -1,0 +1,23 @@
+# =============================================================================
+# autonomous.service
+# =============================================================================
+# PURPOSE:
+#   Systemd unit for continuous autonomous execution
+# =============================================================================
+
+[Unit]
+Description=Autonomous Network Integrity Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash /opt/network_autonomous_daemon.sh
+Restart=always
+RestartSec=5
+
+# Ensures real-time logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
