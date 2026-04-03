@@ -12,10 +12,6 @@ const WORKSPACE_DIR = process.cwd();
 const LOG_FILE      = path.join(WORKSPACE_DIR, "verbatim_handshake.log");
 const DB_FILE       = path.join(WORKSPACE_DIR, "recovery_state.db");
 
-// ── All output goes to log file — never stdout/stderr after startup ───────────
-// stdout is owned by blessed after startDashboard() is called.
-// stderr lines written before blessed starts appear in the terminal briefly
-// then get overwritten — acceptable. After blessed starts, use fileOnly only.
 const fileOnly = (msg: string) => {
   const ts = new Date().toISOString();
   try { fs.appendFileSync(LOG_FILE, `[SERVER ${ts}] ${msg}\n`); } catch { /* ignore */ }
@@ -28,23 +24,19 @@ const log = (msg: string) => {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* ignore */ }
 };
 
-// ── Clean shutdown ────────────────────────────────────────────────────────────
-// Handles SIGINT (Ctrl-C), SIGTERM, and uncaught errors.
-// blessed.screen().destroy() restores the terminal before exit.
 let screenRef: any = null;
 
 const shutdown = (code = 0) => {
   fileOnly(`Shutting down (code ${code})`);
-  try { if (screenRef) { screenRef.destroy(); } } catch { /* ignore */ }
-  // Kill the monitor process group
+  try { if (screenRef) screenRef.destroy(); } catch { /* ignore */ }
   try { execSync("pkill -f 'fix-wifi --monitor' 2>/dev/null || true"); } catch { /* ignore */ }
   process.exit(code);
 };
 
 process.on('SIGINT',  () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
-process.on('unhandledRejection', (r) => { fileOnly(`UNHANDLED REJECTION: ${r}`); });
-process.on('uncaughtException',  (e: Error) => { fileOnly(`UNCAUGHT EXCEPTION: ${e.message}\n${e.stack}`); shutdown(1); });
+process.on('unhandledRejection', (r) => fileOnly(`UNHANDLED REJECTION: ${r}`));
+process.on('uncaughtException',  (e: Error) => { fileOnly(`UNCAUGHT EXCEPTION: ${e.message}`); shutdown(1); });
 
 log(`Initializing Broadcom Control Center...`);
 log(`WORKSPACE_DIR: ${WORKSPACE_DIR}`);
@@ -95,7 +87,155 @@ const dbGet = (key: string, fallback: string): string => {
   } catch { return fallback; }
 };
 
-// ── runCommand: all child output → log file only, never terminal ──────────────
+// ── /api/forensics: parse log into structured categories ─────────────────────
+// Both dashboards consume this. One source of truth for forensic display.
+// Patterns confirmed from fix-wifi.sh source (475 lines, GitHub).
+interface ForensicEvent {
+  ts:       string;
+  category: string;
+  event:    string;
+  detail:   string;
+}
+
+interface ForensicSummary {
+  moduleEvents:    ForensicEvent[];
+  rfkillEvents:    ForensicEvent[];
+  healthEvents:    ForensicEvent[];
+  recoveryEvents:  ForensicEvent[];
+  nmcliEvents:     ForensicEvent[];
+  binaryChecks:    ForensicEvent[];
+  mutexEvents:     ForensicEvent[];
+  pidSignals:      ForensicEvent[];
+  logTailDeduped:  string[];          // last 100 lines, consecutive dups collapsed
+  milestones:      { ts: string; name: string; details: string }[];
+  commands:        { ts: string; cmd: string; rc: string }[];
+}
+
+function parseForensicLog(logFile: string): ForensicSummary {
+  const result: ForensicSummary = {
+    moduleEvents: [], rfkillEvents: [], healthEvents: [],
+    recoveryEvents: [], nmcliEvents: [], binaryChecks: [],
+    mutexEvents: [], pidSignals: [], logTailDeduped: [],
+    milestones: [], commands: [],
+  };
+
+  if (!fs.existsSync(logFile)) return result;
+
+  let raw = '';
+  try {
+    // Read last 200KB — enough for recent events without memory pressure
+    const stat = fs.statSync(logFile);
+    const readSize = Math.min(200000, stat.size);
+    const buf = Buffer.alloc(readSize);
+    const fd  = fs.openSync(logFile, 'r');
+    fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+    fs.closeSync(fd);
+    raw = buf.toString('utf8');
+  } catch { return result; }
+
+  const lines = raw.split('\n').filter(l => l.trim());
+  const clean = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '').trim();
+
+  // ── Dedup consecutive identical lines ────────────────────────────────────
+  const tail = lines.slice(-100);
+  let prev = '', count = 0, prevTs = '';
+  for (const line of tail) {
+    const msg = clean(line).replace(/^\[\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*\]\s*/, '');
+    const ts  = (clean(line).match(/\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*)\]/) || [])[1] || '';
+    if (msg === prev) {
+      count++;
+      prevTs = ts;
+    } else {
+      if (prev) {
+        const suffix = count > 1 ? ` ×${count} (last: ${prevTs.slice(11, 19)})` : '';
+        result.logTailDeduped.push(prev + suffix);
+      }
+      prev = msg; count = 1; prevTs = ts;
+    }
+  }
+  if (prev) {
+    const suffix = count > 1 ? ` ×${count} (last: ${prevTs.slice(11, 19)})` : '';
+    result.logTailDeduped.push(prev + suffix);
+  }
+
+  // ── Parse forensic categories ─────────────────────────────────────────────
+  for (const line of lines) {
+    const c = clean(line);
+    const ts = (c.match(/\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\]]*)\]/) || [])[1]?.slice(11, 19) || '';
+
+    // Module load/unload
+    const modLoad = c.match(/Loading.*module.*\[sudo modprobe (\w+)\]/);
+    if (modLoad) result.moduleEvents.push({ ts, category: 'module', event: 'LOAD', detail: modLoad[1] });
+
+    const modUnload = c.match(/Unloading.*\[sudo modprobe -r ([^\]]+)\]/);
+    if (modUnload) result.moduleEvents.push({ ts, category: 'module', event: 'UNLOAD', detail: modUnload[1] });
+
+    const modFail = c.match(/Module (\w+) not found/);
+    if (modFail) result.moduleEvents.push({ ts, category: 'module', event: 'FAIL', detail: modFail[1] });
+
+    // rfkill
+    const rfkill = c.match(/rfkill (unblock|block) (\w+)/);
+    if (rfkill) result.rfkillEvents.push({ ts, category: 'rfkill', event: rfkill[1].toUpperCase(), detail: rfkill[2] });
+
+    // Health degradation
+    const health = c.match(/HEALTH_DEGRADED.*Score (\d+)\/100.*Reasons: (.+)/);
+    if (health) result.healthEvents.push({ ts, category: 'health', event: `${health[1]}/100`, detail: health[2].trim() });
+
+    // PID signal
+    const pid = c.match(/PID SIGNAL: (-?\d+) \| Health: (\d+)\/100/);
+    if (pid) result.pidSignals.push({ ts, category: 'pid', event: `signal=${pid[1]}`, detail: `health=${pid[2]}/100` });
+
+    // Recovery sequence
+    const rec = c.match(/RECOVERY_SEQUENCE_START.*Health: (\d+)\/100/);
+    if (rec) result.recoveryEvents.push({ ts, category: 'recovery', event: 'START', detail: `from ${rec[1]}/100` });
+
+    const recDone = c.match(/RECOVERY_COMPLETE|recovery sequence complete/i);
+    if (recDone) result.recoveryEvents.push({ ts, category: 'recovery', event: 'COMPLETE', detail: '' });
+
+    // nmcli
+    const nmcli = c.match(/nmcli (networking|device) (\w+) ?(\w*)/);
+    if (nmcli) result.nmcliEvents.push({ ts, category: 'nmcli', event: `${nmcli[1]} ${nmcli[2]}`, detail: nmcli[3] || '' });
+
+    // Binary checks — only failures (verified are too noisy)
+    const binFail = c.match(/WARNING: (\w+) is missing/);
+    if (binFail) result.binaryChecks.push({ ts, category: 'binary', event: 'MISSING', detail: binFail[1] });
+
+    // Mutex
+    const mutex = c.match(/Mutex lock secured by PID (\d+)/);
+    if (mutex) result.mutexEvents.push({ ts, category: 'mutex', event: 'LOCKED', detail: `PID ${mutex[1]}` });
+
+    const mutexRel = c.match(/Releasing hardware mutex/);
+    if (mutexRel) result.mutexEvents.push({ ts, category: 'mutex', event: 'RELEASED', detail: '' });
+  }
+
+  // ── DB: milestones and commands ───────────────────────────────────────────
+  if (fs.existsSync(DB_FILE)) {
+    try {
+      const ms = execSync(
+        `sqlite3 -separator "|||" "${DB_FILE}" "SELECT timestamp, name, details FROM milestones ORDER BY rowid DESC LIMIT 20;"`,
+        { timeout: 2000, encoding: 'utf8' }
+      ).trim();
+      if (ms) result.milestones = ms.split('\n').map(r => {
+        const [ts, name, details] = r.split('|||');
+        return { ts: (ts || '').slice(11, 19), name: name || '', details: details || '' };
+      });
+    } catch { /* DB locked during recovery — return empty */ }
+
+    try {
+      const cmds = execSync(
+        `sqlite3 -separator "|||" "${DB_FILE}" "SELECT timestamp, command, exit_code FROM commands ORDER BY rowid DESC LIMIT 10;"`,
+        { timeout: 2000, encoding: 'utf8' }
+      ).trim();
+      if (cmds) result.commands = cmds.split('\n').map(r => {
+        const [ts, cmd, rc] = r.split('|||');
+        return { ts: (ts || '').slice(11, 19), cmd: (cmd || '').slice(0, 60), rc: rc || '?' };
+      });
+    } catch { /* DB locked */ }
+  }
+
+  return result;
+}
+
 const runCommand = (cmd: string): Promise<void> =>
   new Promise((resolve, reject) => {
     const child = spawn(cmd, [], { shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -106,7 +246,6 @@ const runCommand = (cmd: string): Promise<void> =>
     child.on('close', code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
   });
 
-// ── startMonitor: stdio:ignore — fix-wifi.sh tees its own output to LOG_FILE ──
 const startMonitor = () => {
   fileOnly('Starting background monitor');
   const child = spawn(
@@ -153,6 +292,11 @@ const checkForUpdates = () => {
 app.get("/api/status", (_req, res) =>
   res.json({ isFixing, lastFixError, ...currentTelemetry, metricsHistory, gitUpdateAvailable, localSha, remoteSha })
 );
+
+// New unified forensics endpoint — both dashboards consume this
+app.get("/api/forensics", (_req, res) => {
+  res.json(parseForensicLog(LOG_FILE));
+});
 
 app.get('/api/audit', async (_req, res) => {
   try {
@@ -251,11 +395,6 @@ app.get("/api/events", (req, res) => {
   req.on("close", () => clearInterval(iv));
 });
 
-// ── Startup ───────────────────────────────────────────────────────────────────
-
-// ── Kill stale process on port before binding ─────────────────────────────────
-// Runs inside Node so it cannot kill its own process group.
-// Uses lsof to find the PID then kills only that specific PID.
 const killPortOccupant = (port: number): void => {
   try {
     const pid = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
@@ -266,7 +405,6 @@ const killPortOccupant = (port: number): void => {
           try { process.kill(n, 'SIGTERM'); } catch { /* already gone */ }
         }
       });
-      // Give processes 1s to exit cleanly
       execSync('sleep 1');
     }
   } catch { /* ignore */ }
@@ -275,6 +413,7 @@ const killPortOccupant = (port: number): void => {
 async function startServer() {
   killPortOccupant(3000);
   killPortOccupant(24678);
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: { port: 24678 } },
@@ -293,7 +432,6 @@ async function startServer() {
     checkForUpdates();
     setInterval(checkForUpdates, 60000);
 
-    // ── Telemetry tick ────────────────────────────────────────────────────────
     setInterval(() => {
       const ts = new Date().toISOString();
       let signal = 0, traffic = { rx: 0, tx: 0 }, connectivity = false;
@@ -301,7 +439,7 @@ async function startServer() {
       let healthPing = 0, healthDns = 0, healthRoute = 0;
 
       try {
-        bkwInterface                  = dbGet('bkw_interface',    'Unknown');
+        bkwInterface                  = dbGet('bkw_interface',     'Unknown');
         currentTelemetry.pidKp        = parseInt(dbGet('pid_kp',        '800'));
         currentTelemetry.pidKi        = parseInt(dbGet('pid_ki',        '50'));
         currentTelemetry.pidKd        = parseInt(dbGet('pid_kd',        '300'));
@@ -324,9 +462,9 @@ async function startServer() {
         } catch { /* ignore */ }
 
         if (!isSimulatingFault) {
-          try { execSync("ping -c 1 -W 1 8.8.8.8",        { timeout: 1500, stdio: 'ignore' }); healthPing  = 40; connectivity = true; } catch { }
-          try { execSync("getent hosts google.com",         { timeout: 1500, stdio: 'ignore' }); healthDns   = 30; } catch { }
-          try { execSync("ip route | grep -q '^default'",  { timeout: 1000, stdio: 'ignore' }); healthRoute = 30; } catch { }
+          try { execSync("ping -c 1 -W 1 8.8.8.8",       { timeout: 1500, stdio: 'ignore' }); healthPing  = 40; connectivity = true; } catch { }
+          try { execSync("getent hosts google.com",        { timeout: 1500, stdio: 'ignore' }); healthDns   = 30; } catch { }
+          try { execSync("ip route | grep -q '^default'", { timeout: 1000, stdio: 'ignore' }); healthRoute = 30; } catch { }
         } else {
           signal = -99; traffic = { rx: 0, tx: 0 };
         }
@@ -346,7 +484,6 @@ async function startServer() {
       fileOnly(`tick signal=${signal} conn=${connectivity} health=${health} ping=${healthPing} dns=${healthDns} route=${healthRoute}`);
     }, 2000);
 
-    // ── Start dashboard — pass screenRef back for clean shutdown ──────────────
     setTimeout(() => {
       startDashboard(
         () => ({
